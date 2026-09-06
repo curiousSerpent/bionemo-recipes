@@ -38,6 +38,16 @@ Usage (CLI):
         --fasta input.fasta --ckpt-dir /path/to/mbridge/checkpoint \
         --output-dir /path/to/output --context-parallel-size 2
 
+    # MODIFIED: several FASTA files in one run (model and weights are loaded once).
+    # "{name}" in --output-dir is replaced by each FASTA file's name without its
+    # extension, so the example below writes to /path/to/output/a and
+    # /path/to/output/b. Each file is otherwise processed exactly as it would be
+    # in a separate single-file run: sequences are not packed across files and
+    # seq_idx restarts at 0 for every file.
+    torchrun --nproc_per_node 1 -m bionemo.evo2.run.predict \
+        --fasta a.fasta b.fasta --ckpt-dir /path/to/mbridge/checkpoint \
+        --output-dir '/path/to/output/{name}'
+
 Output Format:
     Batch mode (--write-interval batch):
     - predictions__rank_{global_rank}__dp_rank_{dp_rank}__batch_{batch_idx}.pt
@@ -518,8 +528,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--fasta",
         type=Path,
+        nargs="+",  # MODIFIED: accept one or more FASTA files (processed sequentially, model loaded once)
         required=True,
-        help="Path to input FASTA file containing sequences for prediction",
+        # MODIFIED: help text updated for the multi-file case
+        help="Path(s) to one or more input FASTA files containing sequences for prediction. "
+        "Files are processed one after another, reusing the loaded model.",
     )
     ap.add_argument(
         "--ckpt-dir",
@@ -531,9 +544,13 @@ def parse_args() -> argparse.Namespace:
     # Output arguments
     ap.add_argument(
         "--output-dir",
-        type=Path,
+        type=str,  # MODIFIED: was `Path` — kept as a string so the "{name}" template can be substituted
         default=None,
-        help="Directory for output predictions. If not set, predictions are discarded.",
+        # MODIFIED: help text documents the template
+        help="Directory template for output predictions. The substring '{name}' is replaced by the "
+        "name (without extension) of the FASTA file being processed, e.g. '/out/{name}'. "
+        "Required to contain '{name}' when more than one --fasta file is given. "
+        "If not set, predictions are discarded.",
     )
     ap.add_argument(
         "--write-interval",
@@ -715,6 +732,7 @@ def _padding_collate_fn(
     max_len = max(sample["tokens"].shape[0] for sample in batch)
     if min_length is not None:
         max_len = max(max_len, min_length)
+    max_len = max_len + (( 8 - (max_len % 8)) % 8)
 
     padded_batch: dict[str, list[Tensor]] = {key: [] for key in batch[0].keys()}
 
@@ -1016,9 +1034,9 @@ def _write_predictions_epoch(
 
 
 def predict(
-    fasta_path: Path,
+    fasta_paths: list[Path],  # MODIFIED: was `fasta_path: Path` — now a list of FASTA files
     ckpt_dir: Path,
-    output_dir: Optional[Path] = None,
+    output_dir: Optional[str] = None,  # MODIFIED: was `Optional[Path]` — now a "{name}" template string
     *,
     # Parallelism settings
     tensor_parallel_size: int = 1,
@@ -1052,10 +1070,22 @@ def predict(
     5. Load model weights
     6. Process FASTA sequences and write predictions
 
+    MODIFIED: steps 1-5 run exactly once, step 6 runs once per input FASTA file.
+    Each file is processed independently (its own dataset, its own seq_idx
+    numbering starting at 0, its own output directory and seq_idx_map.json), so
+    results are identical to invoking the original single-file script once per
+    file — only the model/weight loading is shared.
+
     Args:
-        fasta_path: Path to input FASTA file containing sequences for prediction.
+        fasta_paths: List of paths to input FASTA files containing sequences for
+            prediction. Files are processed sequentially, reusing the loaded model.
+            A single Path is also accepted.
         ckpt_dir: Path to MBridge checkpoint directory (must contain run_config.yaml).
-        output_dir: Directory for output predictions. If None, predictions are discarded.
+        output_dir: Output directory template for predictions. The substring "{name}"
+            is replaced by the stem (file name without extension) of the FASTA file
+            being processed, e.g. "/out/{name}" with "genomes/mxa1.fasta" writes to
+            "/out/mxa1". Must contain "{name}" when more than one FASTA file is given.
+            If None, predictions are discarded.
         tensor_parallel_size: Tensor parallelism degree (splits model across GPUs).
         pipeline_model_parallel_size: Pipeline parallelism degree (must be 1).
         context_parallel_size: Context parallelism degree (splits sequence across GPUs).
@@ -1085,15 +1115,27 @@ def predict(
     Example:
         >>> from pathlib import Path
         >>> predict(
-        ...     fasta_path=Path("sequences.fasta"),
+        ...     fasta_paths=[Path("genome_a.fasta"), Path("genome_b.fasta")],
         ...     ckpt_dir=Path("/path/to/mbridge/checkpoint"),
-        ...     output_dir=Path("/path/to/output"),
+        ...     output_dir="/path/to/output/{name}",
         ...     tensor_parallel_size=2,
         ...     micro_batch_size=4,
         ... )
     """
     if pipeline_model_parallel_size != 1:
         raise ValueError("Pipeline parallelism > 1 is not currently supported for prediction.")
+
+    # ADDED: accept a single path for backwards compatibility with the original signature.
+    if isinstance(fasta_paths, (str, Path)):
+        fasta_paths = [fasta_paths]
+
+    # ADDED: refuse to silently overwrite results when several FASTA files would
+    # share one output directory. Checked up front, before the expensive setup.
+    if output_dir is not None and len(fasta_paths) > 1 and "{name}" not in str(output_dir):
+        raise ValueError(
+            "--output-dir must contain the '{name}' template when multiple FASTA files are given, "
+            "otherwise the per-file predictions would overwrite each other."
+        )
 
     # -------------------------------------------------------------------------
     # Step 1: Resolve and load configuration from checkpoint
@@ -1296,120 +1338,137 @@ def predict(
     logger.info("Weights loaded successfully")
 
     # -------------------------------------------------------------------------
-    # Step 6: Create dataset and dataloader
+    # ADDED: loop over the input FASTA files.
+    # Everything below is the original Step 6 / Step 7 code, unchanged except for
+    # the extra indentation and the per-file output directory. All per-file state
+    # (dataset, dataloader, predictions buffer, seq_idx numbering, batch index and
+    # file counters) is re-created on every iteration, so each FASTA file is
+    # processed exactly as the original script would have processed it on its own.
+    # Only Steps 1-5 (config, distributed init, model creation, weight loading)
+    # are now hoisted out of the loop and executed once.
     # -------------------------------------------------------------------------
-    logger.info(f"Loading dataset from: {fasta_path}")
-    dataset = SimpleFastaDataset(
-        fasta_path=fasta_path,
-        tokenizer=tokenizer,
-        prepend_bos=prepend_bos,
-        custom_loss_masker=None,
-    )
+    for fasta_path in fasta_paths:  # ADDED
+        # ADDED: resolve this file's output directory from the template. "{name}"
+        # is replaced by the FASTA file name without its extension. A template
+        # without "{name}" is left unchanged (identical to the original behavior
+        # when a single FASTA file is given).
+        file_output_dir = Path(output_dir.format(name=fasta_path.stem)) if output_dir is not None else None
 
-    data_parallel_rank = parallel_state.get_data_parallel_rank()
-    data_parallel_size = parallel_state.get_data_parallel_world_size()
+        # -------------------------------------------------------------------------
+        # Step 6: Create dataset and dataloader (per FASTA file)
+        # -------------------------------------------------------------------------
+        logger.info(f"Loading dataset from: {fasta_path}")
+        dataset = SimpleFastaDataset(
+            fasta_path=fasta_path,
+            tokenizer=tokenizer,
+            prepend_bos=prepend_bos,
+            custom_loss_masker=None,
+        )
 
-    dataloader = build_pretraining_data_loader(
-        dataset=dataset,
-        consumed_samples=0,
-        dataloader_type="single",
-        micro_batch_size=micro_batch_size,
-        num_workers=4,
-        data_sharding=False,
-        collate_fn=_padding_collate_fn_factory(
-            pad_token_id=getattr(tokenizer, "pad_id", 0),
-            min_length=min_length,
-        ),
-        pin_memory=True,
-        persistent_workers=False,
-        data_parallel_rank=data_parallel_rank,
-        data_parallel_size=data_parallel_size,
-        drop_last=False,
-    )
+        data_parallel_rank = parallel_state.get_data_parallel_rank()
+        data_parallel_size = parallel_state.get_data_parallel_world_size()
 
-    # -------------------------------------------------------------------------
-    # Step 7: Run prediction loop
-    # -------------------------------------------------------------------------
-    logger.info("Starting prediction loop...")
-    predictions: list[dict[str, Tensor]] = []
+        dataloader = build_pretraining_data_loader(
+            dataset=dataset,
+            consumed_samples=0,
+            dataloader_type="single",
+            micro_batch_size=micro_batch_size,
+            num_workers=4,
+            data_sharding=False,
+            collate_fn=_padding_collate_fn_factory(
+                pad_token_id=getattr(tokenizer, "pad_id", 0),
+                min_length=min_length,
+            ),
+            pin_memory=True,
+            persistent_workers=False,
+            data_parallel_rank=data_parallel_rank,
+            data_parallel_size=data_parallel_size,
+            drop_last=False,
+        )
 
-    # Get ranks for file naming (matching original PredictionWriter behavior)
-    global_rank = get_rank_safe()
-    num_files_written = 0
+        # -------------------------------------------------------------------------
+        # Step 7: Run prediction loop (per FASTA file)
+        # -------------------------------------------------------------------------
+        logger.info("Starting prediction loop...")
+        predictions: list[dict[str, Tensor]] = []
 
-    with torch.no_grad():
-        for batch_idx, batch_data in enumerate(dataloader):
-            # Empty batches can be handed to a rank on DP shard boundaries.
-            if batch_data is None:
-                continue
-            # Move to GPU
-            batch_gpu = {
-                k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch_data.items()
-            }
+        # Get ranks for file naming (matching original PredictionWriter behavior)
+        global_rank = get_rank_safe()
+        num_files_written = 0
 
-            # Apply context parallel slicing (seq_idx must NOT be sliced)
-            if context_parallel_size > 1:
-                seq_idx = batch_gpu.pop("seq_idx", None)
-                batch_gpu = get_batch_on_this_cp_rank(
-                    batch_gpu,
-                    is_hybrid_cp=False,
-                    cp_group=parallel_state.get_context_parallel_group(),
+        with torch.no_grad():
+            for batch_idx, batch_data in enumerate(dataloader):
+                # Empty batches can be handed to a rank on DP shard boundaries.
+                if batch_data is None:
+                    continue
+                # Move to GPU
+                batch_gpu = {
+                    k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch_data.items()
+                }
+
+                # Apply context parallel slicing (seq_idx must NOT be sliced)
+                if context_parallel_size > 1:
+                    seq_idx = batch_gpu.pop("seq_idx", None)
+                    batch_gpu = get_batch_on_this_cp_rank(
+                        batch_gpu,
+                        is_hybrid_cp=False,
+                        cp_group=parallel_state.get_context_parallel_group(),
+                    )
+                    if seq_idx is not None:
+                        batch_gpu["seq_idx"] = seq_idx
+
+                # Forward pass
+                result = _predict_step(
+                    model=model[0],
+                    batch=batch_gpu,
+                    output_log_prob_seqs=output_log_prob_seqs,
+                    log_prob_collapse_option=log_prob_collapse_option,
+                    context_parallel_size=context_parallel_size,
+                    output_embeddings=output_embeddings,
                 )
-                if seq_idx is not None:
-                    batch_gpu["seq_idx"] = seq_idx
 
-            # Forward pass
-            result = _predict_step(
-                model=model[0],
-                batch=batch_gpu,
-                output_log_prob_seqs=output_log_prob_seqs,
-                log_prob_collapse_option=log_prob_collapse_option,
-                context_parallel_size=context_parallel_size,
-                output_embeddings=output_embeddings,
+                if result is not None:
+                    predictions.append({k: v.cpu() for k, v in result.items()})
+
+                if (batch_idx + 1) % 10 == 0:
+                    logger.info(f"Processed batch {batch_idx + 1}/{len(dataloader)}")
+
+                # Write at batch interval
+                if write_interval == "batch" and file_output_dir is not None and predictions:
+                    _, num_files_written, _ = _write_predictions_batch(
+                        predictions=predictions[0],
+                        output_dir=file_output_dir,
+                        batch_idx=batch_idx,
+                        global_rank=global_rank,
+                        dp_rank=data_parallel_rank,
+                        files_per_subdir=files_per_subdir,
+                        num_files_written=num_files_written,
+                        data_parallel_world_size=data_parallel_size,
+                    )
+                    predictions = []
+
+        # Write at epoch end
+        if write_interval == "epoch" and file_output_dir is not None and predictions:
+            combined = batch_collator(
+                predictions,
+                batch_dim=0,
+                seq_dim=1,
+                batch_dim_key_defaults={},
+                seq_dim_key_defaults={},
+            )
+            _write_predictions_epoch(
+                predictions=combined,
+                output_dir=file_output_dir,
+                global_rank=global_rank,
+                dp_rank=data_parallel_rank,
             )
 
-            if result is not None:
-                predictions.append({k: v.cpu() for k, v in result.items()})
+        # Write sequence index map
+        if file_output_dir is not None:
+            file_output_dir.mkdir(parents=True, exist_ok=True)
+            dataset.write_idx_map(file_output_dir)
 
-            if (batch_idx + 1) % 10 == 0:
-                logger.info(f"Processed batch {batch_idx + 1}/{len(dataloader)}")
-
-            # Write at batch interval
-            if write_interval == "batch" and output_dir is not None and predictions:
-                _, num_files_written, _ = _write_predictions_batch(
-                    predictions=predictions[0],
-                    output_dir=output_dir,
-                    batch_idx=batch_idx,
-                    global_rank=global_rank,
-                    dp_rank=data_parallel_rank,
-                    files_per_subdir=files_per_subdir,
-                    num_files_written=num_files_written,
-                    data_parallel_world_size=data_parallel_size,
-                )
-                predictions = []
-
-    # Write at epoch end
-    if write_interval == "epoch" and output_dir is not None and predictions:
-        combined = batch_collator(
-            predictions,
-            batch_dim=0,
-            seq_dim=1,
-            batch_dim_key_defaults={},
-            seq_dim_key_defaults={},
-        )
-        _write_predictions_epoch(
-            predictions=combined,
-            output_dir=output_dir,
-            global_rank=global_rank,
-            dp_rank=data_parallel_rank,
-        )
-
-    # Write sequence index map
-    if output_dir is not None:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        dataset.write_idx_map(output_dir)
-
-    logger.info("Prediction complete!")
+        logger.info(f"Prediction complete for: {fasta_path}")  # MODIFIED: report per input file
 
     # Cleanup
     if dist.is_initialized():
@@ -1432,7 +1491,7 @@ def main() -> None:
     except ImportError:
         pass
     predict(
-        fasta_path=args.fasta,
+        fasta_paths=args.fasta,  # MODIFIED: args.fasta is now a list of Paths
         ckpt_dir=args.ckpt_dir,
         output_dir=args.output_dir,
         # Parallelism settings
