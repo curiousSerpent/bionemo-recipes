@@ -199,6 +199,82 @@ class Evo2Preprocessor:
                     split = "test"
             return split
 
+    # ADDED: whole-file split assignment helper, used when file-level splitting is requested.
+    @staticmethod
+    def _assign_file_splits(
+        datapaths: list,
+        train_weight: float,
+        val_weight: float,
+        test_weight: float,
+        seed: Optional[int] = None,
+    ) -> dict[str, str]:
+        """Assign each input file as a whole to the train, validation, or test split.
+
+        The split proportions are applied to the number of *files* rather than the number of sequences, so that
+        every sequence originating from the same file ends up in the same split.
+
+        Args:
+            datapaths (list): Input file paths, as listed in the preprocessing config.
+            train_weight (float): The weight for the training split.
+            val_weight (float): The weight for the validation split.
+            test_weight (float): The weight for the test split.
+            seed (Optional[int]): The seed for the random number generator. Defaults to None.
+
+        Returns:
+            dict[str, str]: Mapping of file path (as a string) to split assignment ('train', 'val', or 'test').
+
+        Raises:
+            ValueError: If the sum of the weights is zero or negative.
+        """
+        # Rectify and normalize split ratios (mirrors _train_val_test_split).
+        total_weight = abs(train_weight) + abs(val_weight) + abs(test_weight)
+        if total_weight <= 0:
+            raise ValueError("Train-validation-test split proportions cannot be zero.")
+        fractions = {
+            Evo2Preprocessor.TRAIN: abs(train_weight) / total_weight,
+            Evo2Preprocessor.VAL: abs(val_weight) / total_weight,
+            Evo2Preprocessor.TEST: abs(test_weight) / total_weight,
+        }
+        # Deduplicate and sort, so that for a given seed the partition depends only on the set of input files
+        # and not on the order in which they happen to be listed in the config.
+        filepaths = sorted({str(path) for path in datapaths})
+        num_files = len(filepaths)
+
+        # Allocate a file count per split via the largest remainder method, so the realized proportions stay as
+        # close as possible to the requested ones even for a small number of files.
+        counts = {split: int(num_files * fraction) for split, fraction in fractions.items()}
+        by_remainder = sorted(fractions, key=lambda split: num_files * fractions[split] - counts[split], reverse=True)
+        for i in range(num_files - sum(counts.values())):
+            counts[by_remainder[i]] += 1
+        # Guarantee that every requested split receives at least one file, if there are enough files to go around.
+        for split, fraction in fractions.items():
+            if fraction > 0 and counts[split] == 0:
+                donor = max(counts, key=lambda candidate: counts[candidate])
+                if counts[donor] > 1:
+                    counts[donor] -= 1
+                    counts[split] += 1
+            if fraction > 0 and counts[split] == 0:
+                logger.warning(
+                    f"File-level splitting: no file could be assigned to the '{split}' split ({num_files} file(s))."
+                )
+
+        # Shuffle before slicing so the assignment does not follow the order of the config.
+        with Evo2Preprocessor.preprocessing_context_manager(seed if seed is not None else None):
+            random.shuffle(filepaths)
+        assignments = {}
+        offset = 0
+        for split in (Evo2Preprocessor.TRAIN, Evo2Preprocessor.VAL, Evo2Preprocessor.TEST):
+            for filepath in filepaths[offset : offset + counts[split]]:
+                assignments[filepath] = split
+            offset += counts[split]
+        logger.info(
+            "File-level split assignment: "
+            f"train={counts[Evo2Preprocessor.TRAIN]}, "
+            f"val={counts[Evo2Preprocessor.VAL]}, "
+            f"test={counts[Evo2Preprocessor.TEST]} (of {num_files} file(s))."
+        )
+        return assignments
+
     @staticmethod
     def _construct_taxonomy_token(
         lineage: Evo2TaxonomyLineage, dropout: float = 0.0, seed: Optional[int] = None
@@ -312,9 +388,13 @@ class Evo2Preprocessor:
             file_sequence_config (tuple): Tuple containing arguments for preprocess_data.
 
         Returns:
-            tuple[list[dict], float]: Preprocessed data and the time taken for preprocessing.
-        """
-        return self.preprocess_data(*file_sequence_config)
+            tuple[str, list[dict], float]: Source file path, preprocessed data, and the time taken for
+                preprocessing.
+        """  # CHANGED: docstring now documents the additional file path element of the returned tuple.
+        preproc_data, elapsed_time = self.preprocess_data(*file_sequence_config)  # CHANGED (was: return ...)
+        # ADDED: pass the originating file path back to the caller (first element of the task tuple) so that
+        # ADDED: preprocess_generator can assign splits per file without re-reading the inputs.
+        return file_sequence_config[0], preproc_data, elapsed_time  # CHANGED
 
     @staticmethod
     def _yield_sequences_from_files(config: Evo2PreprocessingConfig, semaphore: Semaphore):
@@ -342,15 +422,17 @@ class Evo2Preprocessor:
             semaphore.acquire()
             yield from yielder(fname, semaphore)
 
-    def preprocess_generator(self, preproc_config: Evo2PreprocessingConfig):
+    def preprocess_generator(self, preproc_config: Evo2PreprocessingConfig, split_by_file: bool = False):  # CHANGED
         """Main function to preprocess data for Evo2.
 
         Args:
             preproc_config (Evo2PreprocessingConfig): Configuration object containing preprocessing settings.
+            split_by_file (bool): If True, assign whole input files to a single split instead of splitting
+                individual sequences, and apply the split proportions at the file level. Defaults to False.
 
         Yields:
             tuple[dict, float]: Preprocessed sequence data and the time taken for preprocessing.
-        """
+        """  # CHANGED: docstring documents the new split_by_file argument.
         # Track which splits have been assigned
         split_assignments = {
             "train": preproc_config.train_split > 0,
@@ -358,6 +440,18 @@ class Evo2Preprocessor:
             "test": preproc_config.test_split > 0,
         }
         splits_needed = {k for k, v in split_assignments.items() if v}
+        # ADDED: In file-level mode, pre-assign every input file to one split up front. The per-file allocation
+        # ADDED: already guarantees each requested split is populated, so the splits_needed fallback is disabled.
+        file_split_assignments = None
+        if split_by_file:
+            file_split_assignments = self._assign_file_splits(
+                preproc_config.datapaths,
+                preproc_config.train_split,
+                preproc_config.valid_split,
+                preproc_config.test_split,
+                preproc_config.seed,
+            )
+            splits_needed = set()
 
         # Instantiate multiprocessing pool. Use semaphore to limit the amount of sequences to read into memory.
         semaphore = Semaphore(preproc_config.preproc_concurrency + preproc_config.workers)
@@ -376,11 +470,14 @@ class Evo2Preprocessor:
 
         # Preprocess data and split results into train, test, and split.
         with self.preprocessing_context_manager(preproc_config.seed if preproc_config.seed is not None else None):
-            for result, elapsed_time in preproc_tasks:
+            for filepath, result, elapsed_time in preproc_tasks:  # CHANGED (was: for result, elapsed_time in ...)
                 # Release semaphore for the task associated with the result.
                 semaphore.release()
+                # ADDED: File-level mode: every sequence inherits the split assigned to its source file.
+                if file_split_assignments is not None:
+                    split = file_split_assignments[filepath]
                 # If we still need to ensure splits are assigned
-                if splits_needed:
+                elif splits_needed:  # CHANGED (was: if splits_needed:)
                     # Force assign to a needed split
                     split = splits_needed.pop()
                 else:
@@ -392,12 +489,14 @@ class Evo2Preprocessor:
                     sequence["split"] = split
                     yield sequence, elapsed_time
 
-    def preprocess_offline(self, preproc_config: Evo2PreprocessingConfig):
+    def preprocess_offline(self, preproc_config: Evo2PreprocessingConfig, split_by_file: bool = False):  # CHANGED
         """Offline data preprocessing script for Evo2.
 
         Args:
             preproc_config (Evo2PreprocessingConfig): Configuration object containing preprocessing settings.
-        """
+            split_by_file (bool): If True, assign whole input files to a single split instead of splitting
+                individual sequences, and apply the split proportions at the file level. Defaults to False.
+        """  # CHANGED: docstring documents the new split_by_file argument.
         # Validate if binaries have already been produced for the given config and overwrite is set to False.
         if any(
             self._get_output_filename(preproc_config, ext, split).is_file()
@@ -428,7 +527,8 @@ class Evo2Preprocessor:
         avg_preproc_time = 0.0
         avg_index_time = 0.0
         count = 0
-        for sequence, elapsed_time in self.preprocess_generator(preproc_config):
+        # CHANGED (was: for sequence, elapsed_time in self.preprocess_generator(preproc_config):)
+        for sequence, elapsed_time in self.preprocess_generator(preproc_config, split_by_file=split_by_file):
             index_start_time = time.time()
             if sequence["split"] == "train":
                 train_builder.add_item(torch.Tensor(sequence["tokens"]))
@@ -463,6 +563,15 @@ def parse_args():
     """Parse arguments for preprocessing."""
     parser = argparse.ArgumentParser(description="Preprocess FASTA files for training Evo2.")
     parser.add_argument("-c", "--config", type=str, required=True, help="Path to data preprocessing config JSON.")
+    # ADDED: optional flag to keep the sequences of a file together in a single split.
+    parser.add_argument(
+        "--split-by-file",
+        action="store_true",
+        help=(
+            "Assign each input file as a whole to train, validation, or test instead of splitting individual "
+            "sequences. The train/valid/test proportions are then applied to the number of files."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -486,7 +595,8 @@ def main():
         # Instantiate Evo2Preprocessor.
         evo2_preprocessor = Evo2Preprocessor(evo2_preproc_config)
         # Preprocess data specified in config.
-        evo2_preprocessor.preprocess_offline(evo2_preproc_config)
+        # CHANGED (was: evo2_preprocessor.preprocess_offline(evo2_preproc_config))
+        evo2_preprocessor.preprocess_offline(evo2_preproc_config, split_by_file=args.split_by_file)
         end = time.time()
         logger.info(
             f"Finished preprocessing {evo2_preproc_config.output_prefix} ({evo2_preproc_config.datapaths}) in {end - start:.3f} seconds with {evo2_preproc_config.workers} workers."
